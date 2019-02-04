@@ -11,7 +11,12 @@ import (
 	api "github.com/weaveworks/eksctl/pkg/apis/eksctl.io/v1alpha4"
 	"github.com/weaveworks/eksctl/pkg/ctl/cmdutils"
 	"github.com/weaveworks/eksctl/pkg/eks"
+	"github.com/weaveworks/eksctl/pkg/printers"
 	"github.com/weaveworks/eksctl/pkg/utils/kubeconfig"
+)
+
+var (
+	clusterConfigFile = ""
 )
 
 func deleteClusterCmd(g *cmdutils.Grouping) *cobra.Command {
@@ -21,8 +26,8 @@ func deleteClusterCmd(g *cmdutils.Grouping) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "cluster",
 		Short: "Delete a cluster",
-		Run: func(_ *cobra.Command, args []string) {
-			if err := doDeleteCluster(p, cfg, cmdutils.GetNameArg(args)); err != nil {
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := doDeleteCluster(p, cfg, cmdutils.GetNameArg(args), cmd); err != nil {
 				logger.Critical("%s\n", err.Error())
 				os.Exit(1)
 			}
@@ -35,6 +40,7 @@ func deleteClusterCmd(g *cmdutils.Grouping) *cobra.Command {
 		fs.StringVarP(&cfg.Metadata.Name, "name", "n", "", "EKS cluster name (required)")
 		cmdutils.AddRegionFlag(fs, p)
 		cmdutils.AddWaitFlag(&wait, fs)
+		fs.StringVarP(&clusterConfigFile, "config-file", "f", "", "load configuration from a file")
 	})
 
 	cmdutils.AddCommonFlagsForAWS(group, p, true)
@@ -43,26 +49,69 @@ func deleteClusterCmd(g *cmdutils.Grouping) *cobra.Command {
 	return cmd
 }
 
-func doDeleteCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg string) error {
+func doDeleteCluster(p *api.ProviderConfig, cfg *api.ClusterConfig, nameArg string, cmd *cobra.Command) error {
+	meta := cfg.Metadata
+
+	printer := printers.NewJSONPrinter()
+
+	if err := api.Register(); err != nil {
+		return err
+	}
+
+	if clusterConfigFile != "" {
+		if err := eks.LoadConfigFromFile(clusterConfigFile, cfg); err != nil {
+			return err
+		}
+		meta = cfg.Metadata
+
+		incompatibleFlags := []string{
+			"name",
+			"region",
+		}
+
+		for _, f := range incompatibleFlags {
+			if cmd.Flag(f).Changed {
+				return fmt.Errorf("cannot use --%s when --config-file/-f is set", f)
+			}
+		}
+
+		if nameArg != "" {
+			return fmt.Errorf("cannot use name argument %q when --config-file/-f is set")
+		}
+
+		if meta.Name == "" {
+			return fmt.Errorf("metadata.name must be set")
+		}
+
+		if meta.Region == "" {
+			return fmt.Errorf("metadata.region must be set")
+		}
+
+		p.Region = meta.Region
+	} else {
+		if cfg.Metadata.Name != "" && nameArg != "" {
+			return cmdutils.ErrNameFlagAndArg(cfg.Metadata.Name, nameArg)
+		}
+
+		if nameArg != "" {
+			cfg.Metadata.Name = nameArg
+		}
+
+		if cfg.Metadata.Name == "" {
+			return fmt.Errorf("--name must be set")
+		}
+	}
+
 	ctl := eks.New(p, cfg)
 
 	if err := ctl.CheckAuth(); err != nil {
 		return err
 	}
 
-	if cfg.Metadata.Name != "" && nameArg != "" {
-		return cmdutils.ErrNameFlagAndArg(cfg.Metadata.Name, nameArg)
-	}
-
-	if nameArg != "" {
-		cfg.Metadata.Name = nameArg
-	}
-
-	if cfg.Metadata.Name == "" {
-		return fmt.Errorf("--name must be set")
-	}
-
 	logger.Info("deleting EKS cluster %q", cfg.Metadata.Name)
+	if err := printer.LogObj(logger.Debug, "cfg.json = \\\n", cfg); err != nil {
+		return err
+	}
 
 	var deletedResources []string
 
